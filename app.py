@@ -9,7 +9,54 @@ import shap
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-# ── Page config ──────────────────────────────────────────────────────────────
+# ── sklearn imports needed to unpickle the pipeline ──────────────────────────
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.preprocessing import FunctionTransformer
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CRITICAL: these classes must be defined BEFORE joblib.load()
+# The .joblib file was pickled from a notebook where these lived in __main__.
+# Joblib needs to find them here under the same names.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def log_transform_glucose(X):
+    """Log-transform avg_glucose_level (column index 1) in the numerical block."""
+    X = np.asarray(X, dtype=float).copy()
+    X[:, 1] = np.log1p(X[:, 1])
+    return X
+
+
+class DomainInteractionAdder(BaseEstimator, TransformerMixin):
+    """Appends 4 clinical interaction features after the ColumnTransformer."""
+    AGE_IDX        = 0
+    LOG_GLUCOSE_IDX = 1
+    BMI_IDX        = 2
+    HYPER_IDX      = 3
+    HEART_IDX      = 4
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=float)
+        age         = X[:, self.AGE_IDX]
+        log_glucose = X[:, self.LOG_GLUCOSE_IDX]
+        bmi         = X[:, self.BMI_IDX]
+        hyper       = X[:, self.HYPER_IDX]
+        heart       = X[:, self.HEART_IDX]
+
+        interactions = np.column_stack([
+            age * hyper,
+            age * heart,
+            bmi * log_glucose,
+            age * log_glucose,
+        ])
+        return np.hstack([X, interactions])
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Stroke Risk Predictor",
     page_icon="🧠",
@@ -42,11 +89,10 @@ def load_model():
 
 model = load_model()
 
-# ── Feature constants (mirror Week 3 notebook) ────────────────────────────────
+# ── Feature constants ─────────────────────────────────────────────────────────
 NUMERICAL_FEATURES   = ["age", "avg_glucose_level", "bmi"]
 BINARY_FEATURES      = ["hypertension", "heart_disease"]
 CATEGORICAL_FEATURES = ["gender", "ever_married", "work_type", "Residence_type", "smoking_status"]
-ALL_FEATURES = NUMERICAL_FEATURES + BINARY_FEATURES + CATEGORICAL_FEATURES
 
 # ── SHAP helpers ──────────────────────────────────────────────────────────────
 def get_feature_names(fitted_pipe):
@@ -65,8 +111,7 @@ def get_feature_names(fitted_pipe):
     ]
 
     selector = fitted_pipe.named_steps["selector"]
-    selected = np.array(base_names + interaction_names)[selector.get_support()].tolist()
-    return selected
+    return np.array(base_names + interaction_names)[selector.get_support()].tolist()
 
 
 def transform_for_classifier(fitted_pipe, X):
@@ -78,8 +123,7 @@ def transform_for_classifier(fitted_pipe, X):
 
 @st.cache_resource(show_spinner="Building SHAP explainer…")
 def build_explainer(_model):
-    clf = _model.named_steps["classifier"]
-    return shap.TreeExplainer(clf)
+    return shap.TreeExplainer(_model.named_steps["classifier"])
 
 # ── Sidebar — Patient Input ───────────────────────────────────────────────────
 with st.sidebar:
@@ -120,10 +164,9 @@ st.caption(
 )
 
 if not predict_btn:
-    # ── Welcome state ──────────────────────────────────────────────────────────
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.info("**Step 1** — Fill in patient data in the sidebar on the left.")
+        st.info("**Step 1** — Fill in patient data in the sidebar.")
     with col2:
         st.info("**Step 2** — Click **Predict Stroke Risk**.")
     with col3:
@@ -135,40 +178,35 @@ This application uses a **Gradient Boosting** classifier trained on the
 [Kaggle Stroke Prediction Dataset](https://www.kaggle.com/datasets/fedesoriano/stroke-prediction-dataset)
 (5 110 patients, 4.9 % positive class).
 
-**Pipeline highlights:**
-- IterativeImputer (MICE) for BMI missing values
-- Log-transform of average glucose level
-- StandardScaler for numerical features
-- One-hot encoding for categorical variables
-- Domain-informed interaction features: `age × hypertension`, `age × heart_disease`, `bmi × log_glucose`, `age × log_glucose`
-- SelectKBest (k = 7) feature selection
-- RandomizedSearchCV tuning optimised for **Recall** and **PR-AUC**
+**Pipeline:** IterativeImputer → Log-transform glucose → StandardScaler → OneHotEncoder
+→ Domain interaction features → SelectKBest (k=7) → Gradient Boosting
 
-**Primary metrics used for model selection:** Recall and PR-AUC (imbalanced dataset).
+**Interaction features:** `age × hypertension`, `age × heart_disease`, `bmi × log_glucose`, `age × log_glucose`
 
-> ⚠️ This tool is for educational purposes only and must not replace clinical judgement.
+**Primary metrics:** Recall + PR-AUC (severe class imbalance)
+
+> ⚠️ Educational purposes only — not a substitute for clinical judgement.
         """)
 
 else:
     # ── Build input dataframe ──────────────────────────────────────────────────
     input_data = pd.DataFrame([{
-        "age":             age,
+        "age":               age,
         "avg_glucose_level": avg_glucose,
-        "bmi":             bmi,
-        "hypertension":    int(hypertension),
-        "heart_disease":   int(heart_disease),
-        "gender":          gender,
-        "ever_married":    ever_married,
-        "work_type":       work_type,
-        "Residence_type":  residence_type,
-        "smoking_status":  smoking,
+        "bmi":               bmi,
+        "hypertension":      int(hypertension),
+        "heart_disease":     int(heart_disease),
+        "gender":            gender,
+        "ever_married":      ever_married,
+        "work_type":         work_type,
+        "Residence_type":    residence_type,
+        "smoking_status":    smoking,
     }])
 
     # ── Predict ────────────────────────────────────────────────────────────────
     proba      = model.predict_proba(input_data)[0, 1]
     prediction = model.predict(input_data)[0]
 
-    # ── Risk level ────────────────────────────────────────────────────────────
     if proba < 0.30:
         risk_label = "🟢 LOW RISK"
         risk_class = "risk-low"
@@ -176,25 +214,25 @@ else:
     elif proba < 0.55:
         risk_label = "🟡 MEDIUM RISK"
         risk_class = "risk-medium"
-        risk_desc  = "Some risk factors are present. Clinical follow-up is recommended."
+        risk_desc  = "Some risk factors present. Clinical follow-up recommended."
     else:
         risk_label = "🔴 HIGH RISK"
         risk_class = "risk-high"
-        risk_desc  = "Multiple strong risk factors detected. Prompt clinical evaluation is advised."
+        risk_desc  = "Multiple strong risk factors detected. Prompt clinical evaluation advised."
 
-    # ── Layout: result + input summary ────────────────────────────────────────
     col_res, col_inp = st.columns([1, 1], gap="large")
 
     with col_res:
         st.subheader("Prediction Result")
-        st.markdown(f'<div class="{risk_class}">{risk_label}<br><span style="font-size:0.9rem;font-weight:400">{risk_desc}</span></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="{risk_class}">{risk_label}<br>'
+            f'<span style="font-size:0.9rem;font-weight:400">{risk_desc}</span></div>',
+            unsafe_allow_html=True,
+        )
         st.markdown("")
-
-        # Probability gauge
         st.metric("Stroke Probability", f"{proba:.1%}")
         st.progress(float(proba))
 
-        # Confidence bar breakdown
         fig_prob, ax_prob = plt.subplots(figsize=(5, 1.2))
         ax_prob.barh(["No Stroke", "Stroke"], [1 - proba, proba],
                      color=["#198754", "#dc3545"])
@@ -211,16 +249,12 @@ else:
     with col_inp:
         st.subheader("Patient Summary")
         summary = {
-            "Age": age,
-            "Gender": gender,
-            "BMI": f"{bmi:.1f}",
+            "Age": age, "Gender": gender, "BMI": f"{bmi:.1f}",
             "Avg Glucose (mg/dL)": f"{avg_glucose:.1f}",
             "Hypertension": "Yes" if hypertension else "No",
             "Heart Disease": "Yes" if heart_disease else "No",
-            "Ever Married": ever_married,
-            "Work Type": work_type,
-            "Residence": residence_type,
-            "Smoking Status": smoking,
+            "Ever Married": ever_married, "Work Type": work_type,
+            "Residence": residence_type, "Smoking Status": smoking,
         }
         for k, v in summary.items():
             st.markdown(
@@ -230,21 +264,17 @@ else:
 
     st.divider()
 
-    # ── SHAP explanation ──────────────────────────────────────────────────────
+    # ── SHAP ──────────────────────────────────────────────────────────────────
     st.subheader("🔍 SHAP Explanation — What drove this prediction?")
-    st.caption(
-        "SHAP (SHapley Additive exPlanations) shows the contribution of each feature "
-        "to the predicted risk. Red bars push risk **up**; blue bars push risk **down**."
-    )
+    st.caption("Red bars push risk **up**; blue bars push risk **down**.")
 
     try:
-        explainer    = build_explainer(model)
+        explainer     = build_explainer(model)
         feature_names = get_feature_names(model)
         X_transformed = transform_for_classifier(model, input_data)
-        X_transformed_df = pd.DataFrame(X_transformed, columns=feature_names)
+        X_df          = pd.DataFrame(X_transformed, columns=feature_names)
 
-        shap_values_raw = explainer.shap_values(X_transformed_df)
-        # For GBM / XGB, shap_values may be a list [class0, class1] or a 2D array
+        shap_values_raw = explainer.shap_values(X_df)
         if isinstance(shap_values_raw, list):
             sv = shap_values_raw[1][0]
         else:
@@ -257,23 +287,20 @@ else:
             ev = float(expected_val)
 
         expl = shap.Explanation(
-            values=sv,
-            base_values=ev,
-            data=X_transformed_df.iloc[0].values,
-            feature_names=feature_names,
+            values=sv, base_values=ev,
+            data=X_df.iloc[0].values, feature_names=feature_names,
         )
 
-        fig_shap, ax_shap = plt.subplots(figsize=(8, 4))
+        fig_shap, _ = plt.subplots(figsize=(8, 4))
         shap.plots.waterfall(expl, max_display=10, show=False)
         plt.tight_layout()
         st.pyplot(fig_shap, use_container_width=True)
         plt.close()
 
-        # ── Feature importance table ───────────────────────────────────────────
-        with st.expander("📊 View feature contribution table"):
+        with st.expander("📊 Feature contribution table"):
             shap_df = pd.DataFrame({
                 "Feature": feature_names,
-                "Value": X_transformed_df.iloc[0].values.round(4),
+                "Value": X_df.iloc[0].values.round(4),
                 "SHAP Contribution": sv.round(4),
             }).sort_values("SHAP Contribution", key=abs, ascending=False)
             st.dataframe(shap_df, use_container_width=True, hide_index=True)
@@ -283,25 +310,19 @@ else:
 
     st.divider()
 
-    # ── Clinical context ──────────────────────────────────────────────────────
-    with st.expander("📖 Clinical context for this prediction"):
+    with st.expander("📖 Clinical context"):
         st.markdown("""
-**Key stroke risk factors (from the SHAP model):**
-
-| Factor | Direction | Clinical note |
-|--------|-----------|---------------|
-| **Age** | ↑ risk as age increases | Strongest predictor in this model |
-| **Avg Glucose Level** | ↑ risk with hyperglycaemia | Linked to diabetes-related vascular damage |
-| **Hypertension** | ↑ risk if present | Classic modifiable risk factor |
-| **Heart Disease** | ↑ risk if present | Associated with cardioembolic stroke |
+| Factor | Direction | Note |
+|--------|-----------|------|
+| **Age** | ↑ risk | Strongest predictor |
+| **Avg Glucose** | ↑ with hyperglycaemia | Metabolic vascular damage |
+| **Hypertension** | ↑ if present | Classic modifiable risk factor |
+| **Heart Disease** | ↑ if present | Cardioembolic stroke risk |
 | **BMI** | Moderate effect | Obesity increases vascular strain |
-| **Smoking** | ↑ risk (active/former) | Accelerates atherosclerosis |
+| **Smoking** | ↑ active/former | Accelerates atherosclerosis |
 
-> ⚠️ **Disclaimer:** This tool is for *educational and research purposes only*.  
-> It must **not** be used as a substitute for clinical diagnosis or medical advice.
-> Always consult a qualified healthcare professional.
+> ⚠️ **Disclaimer:** Educational and research purposes only. Not a substitute for medical advice.
         """)
 
-# ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.caption("MaKaLe · MSc Machine Learning Group Project · Stroke Prediction · Week 3 Deployment")
